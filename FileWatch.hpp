@@ -74,7 +74,6 @@
 #include <array>
 #include <unordered_map>
 #include <unordered_set>
-#include <system_error>
 #include <string>
 #include <algorithm>
 #include <type_traits>
@@ -86,6 +85,8 @@
 #include <cassert>
 #include <cstdlib>
 #include <iostream>
+#include <variant>
+#include <filesystem>
 
 #ifdef FILEWATCH_PLATFORM_MAC
 extern "C" int __getdirentries64(int, char *, int, long *);
@@ -172,45 +173,68 @@ namespace filewatch {
 	template<class StringType>
 	class FileWatch
 	{
-		typedef typename StringType::value_type C;
-		typedef std::basic_string<C, std::char_traits<C>> UnderpinningString;
-		typedef std::basic_regex<C, std::regex_traits<C>> UnderpinningRegex;
+		using C = typename StringType::value_type;
+		using UnderpinningString = std::basic_string<C, std::char_traits<C>>;
+		using UnderpinningRegex = std::basic_regex<C, std::regex_traits<C>>;
 
 	public:
 
-		FileWatch(StringType path, UnderpinningRegex pattern, std::function<void(const StringType& file, const Event event_type)> callback) :
-			_path(absolute_path_of(path)),
-			_pattern(pattern),
-			_callback(callback),
-                  _directory(get_directory(path))
-		{
-			init();
-		}
+            using CallbackT = std::function<void(const StringType& file, const Event event_type)>;
 
-		FileWatch(StringType path, std::function<void(const StringType& file, const Event event_type)> callback) :
-			FileWatch<StringType>(path, UnderpinningRegex(_regex_all), callback) {}
+            FileWatch() noexcept {};
 
 		~FileWatch() {
 			destroy();
 		}
 
-		FileWatch(const FileWatch<StringType>& other) : FileWatch<StringType>(other._path, other._callback) {}
+            /**
+             * \brief Sets the directory to watch
+             * \param path Relative or absolute path to the directory
+             * \param pattern Regexp pattern to filter in by
+             * \param recurse If true, watch all child directories. Windows always does this regardless of setting
+             */
+            bool set_directory(StringType path, UnderpinningRegex pattern, bool recursive = false) noexcept
+            {
+                  destroy();
+                  _path = path;
+                  _pattern = pattern;
+                  _directory = watch_directory(path, recursive);
+                  return is_valid(_directory);
+            }
+            
+            /**
+             * \brief Set the directory to watch
+             * \param path Relative or absolute path to directory
+             * \param recursive If true, watch all child directories. Windows always does this regardless of setting
+             */
+            bool set_directory(StringType path, bool recursive = false) noexcept
+            {
+                  return set_directory(path, UnderpinningRegex(_regex_all), recursive);
+            }
+            
+            /**
+             * \brief Sets the callback to use
+             * \param callback the callback
+             */
+            void set_callback(CallbackT&& callback) noexcept
+            {
+                  _callback = callback;
+            }
+            
+            /**
+             * \brief Starts watching the directory
+             * \return Returns true if watch was started successfully
+             */
+            bool watch() noexcept
+            {
+                  return init();
+            }
 
-		FileWatch<StringType>& operator=(const FileWatch<StringType>& other) 
-		{
-			if (this == &other) { return *this; }
-
-			destroy();
-			_path = other._path;
-			_callback = other._callback;
-			_directory = get_directory(other._path);
-			init();
-			return *this;
-		}
-
-		// Const memeber varibles don't let me implent moves nicely, if moves are really wanted std::unique_ptr should be used and move that.
+            // Copies and moves of this are forbidden
 		FileWatch<StringType>(FileWatch<StringType>&&) = delete;
 		FileWatch<StringType>& operator=(FileWatch<StringType>&&) & = delete;
+		FileWatch<StringType>& operator=(const FileWatch<StringType>& other) = delete;
+		FileWatch(const FileWatch<StringType>& other) = delete;
 
 	private:
 		static constexpr C _regex_all[] = { '.', '*', '\0' };
@@ -222,7 +246,7 @@ namespace filewatch {
 			StringType directory;
 			StringType filename;
 		};
-		const StringType _path;
+		StringType _path;
 
 		UnderpinningRegex _pattern;
 
@@ -243,8 +267,19 @@ namespace filewatch {
 		std::promise<void> _running;
 		std::atomic<bool> _destory = { false };
 		bool _watching_single_file = { false };
+            
+            template<class T>
+            bool is_valid(const T& t)
+            {
+            #ifdef _WIN32
+                  return !!t;
+            #elif __unix__
+                  return t.folder != -1;
+            #else
+                  #error Impl me
+            #endif
+            }
 
-#pragma mark "Platform specific data"
 #ifdef _WIN32
 		HANDLE _directory = { nullptr };
 		HANDLE _close_event = { nullptr };
@@ -270,8 +305,10 @@ namespace filewatch {
 
 #if __unix__
 		struct FolderInfo {
-			int folder;
-			int watch;
+			int folder = -1;
+			std::vector<int> watches;
+                  
+                  static FolderInfo invalid() { return { -1, {} }; }
 		};
 
 		FolderInfo  _directory;
@@ -324,12 +361,12 @@ namespace filewatch {
             // fd for single file
 #endif // FILEWATCH_PLATFORM_MAC
 
-		void init() 
+		bool init() 
 		{
 #ifdef _WIN32
 			_close_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 			if (!_close_event) {
-				throw std::system_error(GetLastError(), std::system_category());
+                        return false;
 			}
 #endif // WIN32
 
@@ -357,6 +394,8 @@ namespace filewatch {
 
 			std::future<void> future = _running.get_future();
 			future.get(); //block until the monitor_directory is up and running
+                  
+                  return true;
 		}
 
 		void destroy()
@@ -367,7 +406,8 @@ namespace filewatch {
 #ifdef _WIN32
 			SetEvent(_close_event);
 #elif __unix__
-			inotify_rm_watch(_directory.folder, _directory.watch);
+                  for (auto& w : _directory.watches)
+			      inotify_rm_watch(_directory.folder, w);
 #elif FILEWATCH_PLATFORM_MAC
                   if (_run_loop) {
                         CFRunLoopStop(_run_loop);
@@ -375,8 +415,10 @@ namespace filewatch {
 #endif // __unix__
 
 			_cv.notify_all();
-			_watch_thread.join();
-			_callback_thread.join();
+                  if (_watch_thread.joinable())
+			      _watch_thread.join();
+                  if (_callback_thread.joinable())
+			      _callback_thread.join();
 
 #ifdef _WIN32
 			CloseHandle(_directory);
@@ -436,13 +478,13 @@ namespace filewatch {
 			return CreateFileW(lpFileName, args...);
 		}
 
-		HANDLE get_directory(const StringType& path) 
+		HANDLE watch_directory(const StringType& path, bool recursive) 
 		{
 			auto file_info = GetFileAttributesX(path.c_str());
 
 			if (file_info == INVALID_FILE_ATTRIBUTES)
 			{
-				throw std::system_error(GetLastError(), std::system_category());
+                        return nullptr;
 			}
 			_watching_single_file = (file_info & FILE_ATTRIBUTE_DIRECTORY) == false;
 
@@ -470,7 +512,7 @@ namespace filewatch {
 
 			if (directory == INVALID_HANDLE_VALUE)
 			{
-				throw std::system_error(GetLastError(), std::system_category());
+                        return nullptr;
 			}
 			return directory;
 		}
@@ -519,7 +561,7 @@ namespace filewatch {
 				case WAIT_OBJECT_0:
 				{
 					if (!GetOverlappedResult(_directory, &overlapped_buffer, &bytes_returned, TRUE)) {
-						throw std::system_error(GetLastError(), std::system_category());
+                                    return;
 					}
 					async_pending = false;
 
@@ -576,17 +618,17 @@ namespace filewatch {
 			struct stat statbuf = {};
 			if (stat(path.c_str(), &statbuf) != 0)
 			{
-				throw std::system_error(errno, std::system_category());
+                        return false;
 			}
 			return S_ISREG(statbuf.st_mode);
 		}
 
-		FolderInfo get_directory(const StringType& path) 
+		FolderInfo watch_directory(const StringType& path, bool recursive) 
 		{
 			const auto folder = inotify_init();
 			if (folder < 0) 
 			{
-				throw std::system_error(errno, std::system_category());
+                        return FolderInfo::invalid();
 			}
 
 			_watching_single_file = is_file(path);
@@ -604,12 +646,30 @@ namespace filewatch {
 				}
 			}();
 
-			const auto watch = inotify_add_watch(folder, watch_path.c_str(), IN_MODIFY | IN_CREATE | IN_DELETE);
+                  FolderInfo info { folder };
+
+                  const auto masks = IN_MODIFY | IN_CREATE | IN_DELETE;
+			const auto watch = inotify_add_watch(folder, watch_path.c_str(), masks);
 			if (watch < 0) 
 			{
-				throw std::system_error(errno, std::system_category());
+                        return FolderInfo::invalid();
 			}
-			return { folder, watch };
+                  info.watches.push_back(watch);
+                  
+                  if (recursive && !_watching_single_file)
+                  {
+                        std::filesystem::recursive_directory_iterator iter(path);
+                        for (auto& ent : iter)
+                        {
+                              if (!ent.is_directory())
+                                    continue;
+                              const auto watch = inotify_add_watch(folder, (std::filesystem::path(path)/ent).string().c_str(), masks);
+                              if (watch >= 0) // Skipping error-case for recursive dirs
+                                    info.watches.push_back(watch);
+                        }
+                  }
+
+			return info;
 		}
 
 		void monitor_directory() 
@@ -1192,7 +1252,7 @@ namespace filewatch {
                   return openStreamForDirectory(split.directory);
             }
 
-            FSEventStreamRef get_directory(const StringType& directory) {
+            FSEventStreamRef watch_directory(const StringType& directory, bool recursive) {
                   struct stat stat;
 
                   ::stat((const char*)directory.c_str(), &stat);
