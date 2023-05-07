@@ -6,6 +6,7 @@ target_include_directories(Catch INTERFACE ${PROJECT_SOURCE_DIR}/tests/catch/cat
 set(FILEWATCH_UNIT_TEST_TARGET_NAME "filewatch_unit")
 add_executable(${FILEWATCH_UNIT_TEST_TARGET_NAME}
 	${PROJECT_SOURCE_DIR}/tests/CatchMain.cpp
+	${PROJECT_SOURCE_DIR}/tests/catch/catch.cpp
 	${PROJECT_SOURCE_DIR}/tests/Test.cpp)
 
 #target_compile_features(${FILEWATCH_UNIT_TEST_TARGET_NAME} PRIVATE cxx_std_14)
