@@ -6,15 +6,15 @@ project( FileWatch VERSION 0.0.1 LANGUAGES C CXX)
 option(BuildTests "Build the unit tests" ON)
 enable_testing()
 
-# Enable c++11
-set(CMAKE_CXX_STANDARD 11)
+# Enable c++17
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED on)
 
 # Add debug flags
 if(MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zi /MP")
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall -Wextra -Weffc++")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -Wall -Wextra -fdiagnostics-color=always")
 endif()
 
 if(APPLE)
